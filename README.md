@@ -18,7 +18,8 @@ Implemented:
   * buffers are allocated lazily as `AHardwareBuffer`s;
   * `queueBuffer` exports them through `android_wlegl`;
   * `wl_buffer.release` returns them to a small buffer pool;
-  * `dequeueBuffer` blocks when the pool is empty.
+  * `dequeueBuffer` blocks when the pool is empty;
+  * `wl_surface.frame` callbacks pace presentation to the compositor's vsync.
 * Surface capability patching and swapchain-extent handling.
 * A provider override for compositors/embedders
   (`vkwlSetWaylandWindowProvider` or an exported
@@ -32,9 +33,9 @@ Not implemented yet:
   through this shim, but the native `vkCreateDevice` path may bypass them.  The
   surface extent still flows through `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`
   and `ANativeWindow.perform(SET_BUFFERS_DIMENSIONS)`.
-* Explicit VSync pacing.  Presentation is paced by `wl_buffer.release` and the
-  buffer-pool blocking behavior.  The compositor decides when buffers are
-  released.
+* Unconditional vsync.  If the compositor does not answer a frame callback
+  within 200 ms, the shim disables the wait for that window and falls back to
+  buffer-release/pool backpressure.
 
 ## How it works
 
@@ -82,10 +83,13 @@ It is not a wrapper around a Java/Surface object.
 * `dequeueBuffer` allocates an `AHardwareBuffer` matching the requested
   width/height/format/usage and returns its `ANativeWindowBuffer`.
 * `queueBuffer` waits on the driver's sync fence, exports the AHB with
-  `android_wlegl`, attaches the resulting `wl_buffer`, damages and commits the
-  `wl_surface`.
+  `android_wlegl`, attaches the resulting `wl_buffer`, requests a
+  `wl_surface.frame` callback, and commits the `wl_surface`.
+* The private queue is dispatched until the frame callback arrives, so
+  `queueBuffer` returns at most once per compositor vsync.  This is what
+  replaces Android's normal buffer-queue throttling.
 * `wl_buffer.release` puts the buffer back into the pool.
-* `dequeueBuffer` blocks on a private Wayland event queue until a release or
+* `dequeueBuffer` blocks on the private Wayland event queue until a release or
   another event arrives.
 * All private protocol objects (registry, `android_wlegl`, buffers, frame
   callbacks) use a private `wl_event_queue` and proxy wrappers, so the app's
@@ -225,8 +229,9 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
   shared memory.
 * No EGL/GLES integration yet.  Only Vulkan clients that use
   `VK_KHR_wayland_surface` are covered.
-* Buffer pacing depends on the compositor's `wl_buffer.release` behavior.
-  TAWC does not deliver frame callbacks for these externally imported buffers.
+* Presentation uses `wl_surface.frame` callbacks.  A compositor that never
+  answers one makes the shim fall back to release-based pacing after a 200 ms
+  timeout; such a client is not vsync-limited.
 * The swapchain hooks are not guaranteed to run for every app, because the
   native loader may resolve device commands directly from the native device.
   The capability and `perform` paths are the reliable ones.

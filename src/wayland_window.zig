@@ -8,8 +8,8 @@
 //!   * `queueBuffer` exports the AHB through `android_wlegl` and attaches the
 //!     resulting `wl_buffer`;
 //!   * `wl_buffer.release` returns the buffer to the pool;
-//!   * `wl_surface.frame` is requested when available, but buffer release is
-//!     the authoritative pacing signal.
+//!   * `wl_surface.frame` callbacks pace `queueBuffer` to the compositor's
+//!     refresh, falling back to release/pool backpressure if they stop arriving.
 //!
 //! The driver only sees the embedded `ANativeWindow`.  Zig does not guarantee
 //! that a regular struct keeps its fields in declaration order, so the reverse
@@ -46,6 +46,7 @@ const EPIPE: c_int = 32;
 
 const max_buffers = 4;
 const default_target_buffers = 3;
+const frame_wait_timeout_ms: c_int = 200;
 
 const BufferState = enum {
     free,
@@ -107,6 +108,10 @@ pub const WaylandNativeWindow = struct {
     fronted_len: usize = 0,
 
     frame_callback: ?*c.wl_callback = null,
+    /// Cleared if the compositor does not answer a frame callback.  Keeping
+    /// the flag avoids stalling every present on compositors without frame
+    /// callbacks.
+    frame_wait_supported: bool = true,
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     destroying: bool = false,
 
@@ -391,14 +396,9 @@ pub const WaylandNativeWindow = struct {
         } else {
             c.wl_surface_damage(surface, 0, 0, buf.base.width, buf.base.height);
         }
-        c.wl_surface_commit(surface);
 
-        buf.state = .fronted;
-        if (self.fronted_len < self.fronted.len) {
-            self.fronted[self.fronted_len] = buf;
-            self.fronted_len += 1;
-        }
-
+        // Request the callback before the commit that schedules this frame.
+        // The compositor answers it on its next vsync tick.
         if (self.swap_interval > 0 and self.frame_callback == null) {
             if (c.wl_surface_frame(surface)) |cb| {
                 wl.setQueue(cb, queue);
@@ -407,8 +407,103 @@ pub const WaylandNativeWindow = struct {
             }
         }
 
+        c.wl_surface_commit(surface);
+
+        buf.state = .fronted;
+        if (self.fronted_len < self.fronted.len) {
+            self.fronted[self.fronted_len] = buf;
+            self.fronted_len += 1;
+        }
+
         _ = c.wl_display_flush(self.display);
         return 0;
+    }
+
+    /// Wait for a specific frame callback, dispatching the private queue in
+    /// bounded slices so a compositor that never answers cannot hang the
+    /// present path forever.
+    fn waitForFrame(self: *WaylandNativeWindow, cb: *c.wl_callback) c_int {
+        while (true) {
+            pthread_mutex_lock(&self.mutex);
+            if (self.destroying) {
+                pthread_mutex_unlock(&self.mutex);
+                return -EPIPE;
+            }
+            if (!self.frame_wait_supported or self.frame_callback != cb) {
+                pthread_mutex_unlock(&self.mutex);
+                return 0;
+            }
+            pthread_mutex_unlock(&self.mutex);
+
+            const rc = self.dispatchTimeout(frame_wait_timeout_ms);
+            if (rc < 0) return -EPIPE;
+            if (rc == 0) {
+                pthread_mutex_lock(&self.mutex);
+                if (self.frame_wait_supported and self.frame_callback == cb) {
+                    self.frame_wait_supported = false;
+                    native.log("no frame callback within {d} ms; disabling vsync wait", .{frame_wait_timeout_ms});
+                }
+                pthread_mutex_unlock(&self.mutex);
+                return 0;
+            }
+        }
+    }
+
+    /// Dispatch the private queue, but return after `timeout_ms` if no event
+    /// arrives.  Returns 1 after an event/dispatch attempt, 0 on timeout.
+    fn dispatchTimeout(self: *WaylandNativeWindow, timeout_ms: c_int) c_int {
+        const queue = self.queue orelse return -EINVAL;
+        const display = self.display;
+        pthread_mutex_lock(&self.dispatch_mutex);
+        defer pthread_mutex_unlock(&self.dispatch_mutex);
+
+        const prep = c.wl_display_prepare_read_queue(display, queue);
+        if (prep != 0) {
+            if (std.c.errno(prep) == .AGAIN) {
+                const rc = c.wl_display_dispatch_queue_pending(display, queue);
+                if (rc < 0) {
+                    native.log("wl_display_dispatch_queue_pending failed: {d}", .{c.wl_display_get_error(display)});
+                    return -EPIPE;
+                }
+                // Another thread currently owns the display read lock.  Give
+                // it a moment rather than spinning.
+                const pause = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+                _ = std.c.nanosleep(&pause, null);
+                return 1;
+            }
+            native.log("wl_display_prepare_read_queue failed: {s}", .{@tagName(std.c.errno(prep))});
+            return -EPIPE;
+        }
+
+        _ = c.wl_display_flush(display);
+
+        var pfd = std.c.pollfd{
+            .fd = c.wl_display_get_fd(display),
+            .events = std.c.POLL.IN,
+            .revents = 0,
+        };
+        const prc = std.c.poll(@ptrCast(&pfd), 1, timeout_ms);
+        if (prc == 0) {
+            c.wl_display_cancel_read(display);
+            return 0;
+        }
+        if (prc < 0) {
+            c.wl_display_cancel_read(display);
+            if (std.c.errno(prc) == .INTR) return 1;
+            native.log("poll on Wayland fd failed: {s}", .{@tagName(std.c.errno(prc))});
+            return -EPIPE;
+        }
+
+        if (c.wl_display_read_events(display) < 0) {
+            native.log("wl_display_read_events failed: {d}", .{c.wl_display_get_error(display)});
+            return -EPIPE;
+        }
+        const rc = c.wl_display_dispatch_queue_pending(display, queue);
+        if (rc < 0) {
+            native.log("wl_display_dispatch_queue_pending failed: {d}", .{c.wl_display_get_error(display)});
+            return -EPIPE;
+        }
+        return 1;
     }
 
     fn dispatchBlocking(self: *WaylandNativeWindow) c_int {
@@ -627,10 +722,6 @@ fn queueBuffer(
         return -EINVAL;
     }
 
-    // Frame callbacks are useful for FIFO pacing, but not every compositor
-    // implements them for externally-imported buffers.  Buffer release events
-    // are the authoritative pacing signal; dequeueBuffer blocks when the pool
-    // is empty.  Do not block queueBuffer on a callback that may never come.
     buf.state = .queued;
     if (!self.pushPendingLocked(buf)) {
         buf.state = .free;
@@ -641,7 +732,17 @@ fn queueBuffer(
     }
 
     const rc = self.drainOneLocked();
+    var wait_cb: ?*c.wl_callback = null;
+    if (rc == 0 and self.swap_interval > 0 and self.frame_wait_supported) {
+        wait_cb = self.frame_callback;
+    }
     pthread_mutex_unlock(&self.mutex);
+
+    // FIFO-like pacing: do not return the present until the compositor has
+    // reached the next vsync.  `dequeueBuffer` still blocks for buffer
+    // availability, but TAWC releases buffers promptly, so release events
+    // alone are not enough to throttle an uncapped client.
+    if (wait_cb) |cb| return self.waitForFrame(cb);
     return rc;
 }
 
