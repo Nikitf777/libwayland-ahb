@@ -70,6 +70,15 @@ libvkwl.so
 Android platform Vulkan loader -> /vendor/lib64/hw/vulkan.adreno.so
 ```
 
+Libraries such as wlroots link directly against `libvulkan.so.1` and therefore
+need the Vulkan symbols at load time, before any `vkGetInstanceProcAddr` call.
+The shim exports the native loader's entry-point set as direct tail-call stubs.
+The stubs jump through slots filled by a constructor at library load time, so
+they preserve every argument register and do not need a prototype per command.
+`src/vulkan_forwarders.S` and `src/vulkan_forwarders.c` are generated from the
+native loader's dynamic symbol table; regenerate them with
+`scripts/generate-vulkan-forwarders.py` when the loader changes.
+
 ### Extension translation
 
 1. `vkEnumerateInstanceExtensionProperties` appends
@@ -221,11 +230,14 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
 | `src/native.zig` | Native loader discovery |
 | `src/dlfcn.zig` | Minimal `dlopen`/`dlsym` bindings |
 | `src/vk.zig` | Minimal Vulkan ABI types |
+| `src/vulkan_forwarders.S` | Generated direct-call stubs for native entry points |
+| `src/vulkan_forwarders.c` | Generated constructor that resolves forwarder slots |
 | `src/protocol/` | Generated `android_wlegl` client protocol |
 | `protocols/android_wlegl.xml` | Source protocol definition |
 | `scripts/tawc-run.sh` | Run a client under TAWC with the shim |
 | `scripts/vulkaninfo-wrapper.sh` | Run `vulkaninfo` with the shim |
 | `scripts/generate-protocols.sh` | Regenerate the vendored protocol files |
+| `scripts/generate-vulkan-forwarders.py` | Regenerate direct-call forwarders |
 
 ## ABI notes
 
@@ -253,10 +265,12 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
   answers one makes the shim fall back to release-based pacing after a 200 ms
   timeout; such a client is not vsync-limited.
 * The swapchain hooks are installed through this shim's
-  `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`.  A loader that bypasses
-  both and resolves native device commands directly will not notify the shim
-  about swapchain creation, so buffer registration and extent rewriting will
-  not apply.  The capability and `perform` paths do not depend on that.
+  `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` and its direct exports of the
+  surface-capability and create/destroy-swapchain entry points.  A client that
+  loads the native loader itself and resolves native device commands there will
+  not notify the shim about swapchain creation, so buffer registration and
+  extent rewriting will not apply.  The capability and `perform` paths do not
+  depend on that.
 * The fixed `perform` ABI is required by the Adreno driver.  A different vendor
   driver may use the normal variadic calling convention and need a different
   thunk.

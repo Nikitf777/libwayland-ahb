@@ -66,6 +66,16 @@ pub fn build(b: *std.Build) void {
         .file = b.path("src/protocol/android_wlegl_client.c"),
         .flags = &.{},
     });
+    // wlroots and other directly-linked clients need the full native Vulkan
+    // entry-point table, not only the entry points the shim wraps.
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("src/vulkan_forwarders.S"),
+        .flags = &.{},
+    });
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("src/vulkan_forwarders.c"),
+        .flags = &.{},
+    });
 
     b.installArtifact(lib);
 }

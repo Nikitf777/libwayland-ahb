@@ -74,6 +74,36 @@ export fn vkGetPhysicalDeviceWaylandPresentationSupportKHR(
     return wrapper.getPhysicalDeviceWaylandPresentationSupportKHR(physicalDevice, queueFamilyIndex, display);
 }
 
+export fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+    physicalDevice: vk.VkPhysicalDevice,
+    surface: vk.VkSurfaceKHR,
+    pSurfaceCapabilities: ?*vk.VkSurfaceCapabilitiesKHR,
+) callconv(.c) vk.VkResult {
+    return wrapper.getPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, pSurfaceCapabilities);
+}
+
+export fn vkCreateSwapchainKHR(
+    device: vk.VkDevice,
+    pCreateInfo: ?*const vk.VkSwapchainCreateInfoKHR,
+    pAllocator: ?*const anyopaque,
+    pSwapchain: ?*vk.VkSwapchainKHR,
+) callconv(.c) vk.VkResult {
+    return wrapper.createSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+}
+
+export fn vkDestroySwapchainKHR(
+    device: vk.VkDevice,
+    swapchain: vk.VkSwapchainKHR,
+    pAllocator: ?*const anyopaque,
+) callconv(.c) void {
+    wrapper.destroySwapchainKHR(device, swapchain, pAllocator);
+}
+
+/// Internal helper for the generated direct-call forwarders.
+export fn vkwl_lookup_native(name: [*:0]const u8) callconv(.c) ?*anyopaque {
+    return native.lookupRaw(name);
+}
+
 /// Public hook for an in-process Wayland compositor / embedding toolkit.
 ///
 /// The provider is called from vkCreateWaylandSurfaceKHR and must return an

@@ -80,13 +80,17 @@ pub fn getGdpa() ?vk.PFN_vkGetDeviceProcAddr {
     return gdpa;
 }
 
-/// Look up a symbol exported by the real loader (used for functions whose
-/// prototype does not carry a VkInstance, e.g. physical-device queries).
-pub fn lookup(comptime T: type, name: [*:0]const u8) ?T {
+pub fn lookupRaw(name: [*:0]const u8) ?*anyopaque {
     lock();
     defer unlock();
     initLocked();
     const h = handle orelse return null;
-    const symbol = dlfcn.dlsym(h, name) orelse return null;
+    return dlfcn.dlsym(h, name);
+}
+
+/// Look up a symbol exported by the real loader (used for functions whose
+/// prototype does not carry a VkInstance, e.g. physical-device queries).
+pub fn lookup(comptime T: type, name: [*:0]const u8) ?T {
+    const symbol = lookupRaw(name) orelse return null;
     return @ptrCast(@alignCast(symbol));
 }
