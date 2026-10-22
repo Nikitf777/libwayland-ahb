@@ -44,7 +44,7 @@ const EINVAL: c_int = 22;
 const ENOMEM: c_int = 12;
 const EPIPE: c_int = 32;
 
-const max_buffers = 4;
+const max_buffers = 8;
 const default_target_buffers = 3;
 const frame_wait_timeout_ms: c_int = 200;
 
@@ -63,6 +63,13 @@ pub const Buffer = struct {
     ahb: *ahb.HardwareBuffer,
     wl_buffer: ?*c.wl_buffer = null,
     state: BufferState = .free,
+    /// True once the native swapchain has dequeued this buffer while being
+    /// created.  Android WSI only accepts buffers that are part of its current
+    /// swapchain; returning any other pool buffer from dequeueBuffer makes
+    /// AcquireNextImageKHR report OUT_OF_DATE (and cancels the buffer).
+    /// Defaults to true so a client whose swapchain creation bypasses the shim
+    /// still gets the old allocation behavior.
+    registered: bool = true,
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     alloc_width: i32 = 0,
     alloc_height: i32 = 0,
@@ -107,11 +114,26 @@ pub const WaylandNativeWindow = struct {
     fronted: [max_buffers]?*Buffer = @splat(null),
     fronted_len: usize = 0,
 
+    /// Set between our vkCreateSwapchainKHR hook and the native create call.
+    /// While set, dequeueBuffer may allocate and return new buffers; after the
+    /// call returns, only the buffers it actually dequeued stay registered.
+    in_swapchain_create: bool = false,
+    create_buffers: [max_buffers]?*Buffer = @splat(null),
+    create_buffer_len: usize = 0,
+
     frame_callback: ?*c.wl_callback = null,
     /// Cleared if the compositor does not answer a frame callback.  Keeping
     /// the flag avoids stalling every present on compositors without frame
     /// callbacks.
     frame_wait_supported: bool = true,
+    /// True after the compositor has answered at least one frame callback.
+    /// Only then is it safe to treat a timeout as "compositor suspended".
+    frame_callbacks_seen: bool = false,
+    /// The compositor stopped answering frame callbacks (typically because
+    /// the TAWC activity was backgrounded).  `dequeueBuffer` parks here until
+    /// a callback arrives again so the client cannot spin recreating
+    /// swapchains while hidden.
+    suspended: bool = false,
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     destroying: bool = false,
 
@@ -197,6 +219,77 @@ pub const WaylandNativeWindow = struct {
         native.log("Wayland window resized to {d}x{d}", .{ w, h });
     }
 
+    /// Called immediately before the real vkCreateSwapchainKHR.  Buffers
+    /// dequeued during the call are the ones the native swapchain owns.
+    pub fn beginSwapchainCreate(self: *WaylandNativeWindow) void {
+        pthread_mutex_lock(&self.mutex);
+        defer pthread_mutex_unlock(&self.mutex);
+        self.in_swapchain_create = true;
+        self.create_buffer_len = 0;
+        @memset(&self.create_buffers, null);
+    }
+
+    /// Called after the real vkCreateSwapchainKHR returns.  On success the
+    /// recorded buffers become the only buffers the swapchain will accept.
+    /// Any other free buffer is dead weight and is retired; an old fronted
+    /// buffer is retired when the compositor releases it.
+    pub fn finishSwapchainCreate(self: *WaylandNativeWindow, success: bool) void {
+        pthread_mutex_lock(&self.mutex);
+        defer pthread_mutex_unlock(&self.mutex);
+        self.in_swapchain_create = false;
+
+        if (success) {
+            for (&self.buffers) |*slot| {
+                const buf = slot.* orelse continue;
+                buf.registered = false;
+            }
+            for (self.create_buffers[0..self.create_buffer_len]) |buf| {
+                buf.?.registered = true;
+            }
+        }
+
+        var i: usize = 0;
+        while (i < self.buffers.len) {
+            const buf = self.buffers[i] orelse {
+                i += 1;
+                continue;
+            };
+            if (!buf.registered and buf.state == .free) {
+                self.buffers[i] = null;
+                if (self.youngest == buf) self.youngest = null;
+                if (self.free_count > 0) self.free_count -= 1;
+                bufferDecRef(&buf.base.common);
+            }
+            i += 1;
+        }
+
+        self.create_buffer_len = 0;
+        @memset(&self.create_buffers, null);
+    }
+
+    fn noteCreateBufferLocked(self: *WaylandNativeWindow, buf: *Buffer) void {
+        if (!self.in_swapchain_create) return;
+        for (self.create_buffers[0..self.create_buffer_len]) |existing| {
+            if (existing == buf) return;
+        }
+        if (self.create_buffer_len < self.create_buffers.len) {
+            self.create_buffers[self.create_buffer_len] = buf;
+            self.create_buffer_len += 1;
+        }
+    }
+
+    fn retireBufferLocked(self: *WaylandNativeWindow, buf: *Buffer) void {
+        for (&self.buffers) |*slot| {
+            if (slot.* == buf) {
+                slot.* = null;
+                break;
+            }
+        }
+        if (self.youngest == buf) self.youngest = null;
+        if (buf.state == .free and self.free_count > 0) self.free_count -= 1;
+        bufferDecRef(&buf.base.common);
+    }
+
     // ------------------------------------------------------------------
     // Buffer pool
     // ------------------------------------------------------------------
@@ -217,6 +310,16 @@ pub const WaylandNativeWindow = struct {
             if (self.youngest == buf) self.youngest = null;
             if (self.free_count > 0) self.free_count -= 1;
             bufferDecRef(&buf.base.common);
+        }
+
+        if (!self.in_swapchain_create) {
+            // Normal acquires must not grow the pool: Android WSI would not
+            // know about a buffer added after swapchain creation.  The one
+            // exception is initial bring-up when creation was not intercepted
+            // at all; preserve the historical lazy allocation in that case.
+            for (self.buffers) |slot| {
+                if (slot != null) return 0;
+            }
         }
 
         var count: usize = 0;
@@ -243,6 +346,34 @@ pub const WaylandNativeWindow = struct {
         }
 
         return 0;
+    }
+
+    /// Allocate one spare buffer beyond `target_buffer_count`.  Android WSI
+    /// recreates a swapchain by dequeuing a full set of images before the old
+    /// front buffer is released; without a spare the fourth dequeue blocks
+    /// forever while the compositor is suspended.
+    fn growOneLocked(self: *WaylandNativeWindow) bool {
+        // Only the swapchain-creation path may introduce a buffer.  Allocating
+        // one for a normal acquire would hand Android WSI a buffer it never
+        // registered, which it treats as an out-of-date swapchain.
+        if (!self.in_swapchain_create) return false;
+
+        var count: usize = 0;
+        for (self.buffers) |slot| {
+            if (slot != null) count += 1;
+        }
+        if (count >= max_buffers) return false;
+
+        const buf = self.createBufferLocked() orelse return false;
+        for (&self.buffers) |*slot| {
+            if (slot.* == null) {
+                slot.* = buf;
+                self.free_count += 1;
+                return true;
+            }
+        }
+        bufferDecRef(&buf.base.common);
+        return false;
     }
 
     fn createBufferLocked(self: *WaylandNativeWindow) ?*Buffer {
@@ -318,7 +449,7 @@ pub const WaylandNativeWindow = struct {
         return buf;
     }
 
-    fn pickFreeLocked(self: *WaylandNativeWindow) ?*Buffer {
+    fn pickFreeLocked(self: *WaylandNativeWindow, allow_unregistered: bool) ?*Buffer {
         if (self.free_count == 0) return null;
 
         // Avoid immediately reusing the buffer the compositor just released;
@@ -326,12 +457,15 @@ pub const WaylandNativeWindow = struct {
         for (self.buffers) |slot| {
             const buf = slot orelse continue;
             if (buf.state != .free) continue;
+            if (!allow_unregistered and !buf.registered) continue;
             if (buf == self.youngest) continue;
             return buf;
         }
         for (self.buffers) |slot| {
             const buf = slot orelse continue;
-            if (buf.state == .free) return buf;
+            if (buf.state != .free) continue;
+            if (!allow_unregistered and !buf.registered) continue;
+            return buf;
         }
         return null;
     }
@@ -441,7 +575,12 @@ pub const WaylandNativeWindow = struct {
                 pthread_mutex_lock(&self.mutex);
                 if (self.frame_wait_supported and self.frame_callback == cb) {
                     self.frame_wait_supported = false;
-                    native.log("no frame callback within {d} ms; disabling vsync wait", .{frame_wait_timeout_ms});
+                    if (self.frame_callbacks_seen) {
+                        self.suspended = true;
+                        native.log("no frame callback within {d} ms; suspending presentation", .{frame_wait_timeout_ms});
+                    } else {
+                        native.log("no frame callback within {d} ms; disabling vsync wait", .{frame_wait_timeout_ms});
+                    }
                 }
                 pthread_mutex_unlock(&self.mutex);
                 return 0;
@@ -679,17 +818,38 @@ fn dequeueBuffer(
             pthread_mutex_unlock(&self.mutex);
             return -EPIPE;
         }
+        if (self.suspended) {
+            pthread_mutex_unlock(&self.mutex);
+            // Wait for the compositor's next frame callback, which is sent
+            // when the activity becomes visible again.  Use a timeout so
+            // destruction/teardown can still make progress.
+            const rc = self.dispatchTimeout(frame_wait_timeout_ms);
+            if (rc < 0) return -EPIPE;
+            continue;
+        }
         if (self.ensureBuffersLocked() != 0) {
             pthread_mutex_unlock(&self.mutex);
             return -ENOMEM;
         }
-        if (self.pickFreeLocked()) |buf| {
+        if (self.pickFreeLocked(self.in_swapchain_create)) |buf| {
+            self.noteCreateBufferLocked(buf);
             buf.state = .dequeued;
             if (self.free_count > 0) self.free_count -= 1;
             out.* = &buf.base;
             fence.* = -1;
             pthread_mutex_unlock(&self.mutex);
             return 0;
+        }
+        if (self.growOneLocked()) {
+            if (self.pickFreeLocked(true)) |buf| {
+                self.noteCreateBufferLocked(buf);
+                buf.state = .dequeued;
+                if (self.free_count > 0) self.free_count -= 1;
+                out.* = &buf.base;
+                fence.* = -1;
+                pthread_mutex_unlock(&self.mutex);
+                return 0;
+            }
         }
         pthread_mutex_unlock(&self.mutex);
 
@@ -718,6 +878,7 @@ fn queueBuffer(
         return -EPIPE;
     }
     if (buf.state != .dequeued) {
+        native.log("queue buffer rejected: state={s}", .{@tagName(buf.state)});
         pthread_mutex_unlock(&self.mutex);
         return -EINVAL;
     }
@@ -759,10 +920,16 @@ fn cancelBuffer(
 
     pthread_mutex_lock(&self.mutex);
     defer pthread_mutex_unlock(&self.mutex);
-    if (buf.state != .dequeued) return -EINVAL;
+    if (buf.state != .dequeued) {
+        native.log("cancel buffer ignored: state={s}", .{@tagName(buf.state)});
+        return -EINVAL;
+    }
     buf.state = .free;
     self.free_count += 1;
     self.youngest = buf;
+    if (!self.in_swapchain_create and !buf.registered) {
+        self.retireBufferLocked(buf);
+    }
     return 0;
 }
 
@@ -793,11 +960,18 @@ fn query(base: *const nw.ANativeWindow, what: c_int, out: *c_int) callconv(.c) c
     pthread_mutex_lock(&self.mutex);
     defer pthread_mutex_unlock(&self.mutex);
 
+    return queryLocked(self, what, out);
+}
+
+fn queryLocked(self: *WaylandNativeWindow, what: c_int, out: *c_int) c_int {
     switch (what) {
         nw.NATIVE_WINDOW_WIDTH, nw.NATIVE_WINDOW_DEFAULT_WIDTH => out.* = self.width,
         nw.NATIVE_WINDOW_HEIGHT, nw.NATIVE_WINDOW_DEFAULT_HEIGHT => out.* = self.height,
         nw.NATIVE_WINDOW_FORMAT => out.* = self.format,
-        nw.NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS => out.* = @intCast(if (self.target_buffer_count > 0) self.target_buffer_count - 1 else 0),
+        // Do not derive this from target_buffer_count: the driver feeds it
+        // back into its next SET_BUFFER_COUNT, which would make the pool grow
+        // on every suspend/resume cycle.
+        nw.NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS => out.* = @intCast(default_target_buffers - 1),
         nw.NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER => out.* = 0,
         nw.NATIVE_WINDOW_CONCRETE_TYPE => out.* = nw.NATIVE_WINDOW_SURFACE,
         nw.NATIVE_WINDOW_TRANSFORM_HINT => out.* = 0,
@@ -946,6 +1120,9 @@ fn onBufferRelease(data: ?*anyopaque, buffer: ?*c.wl_buffer) callconv(.c) void {
                 self.free_count += 1;
                 self.youngest = buf;
             }
+            if (!self.in_swapchain_create and !buf.registered) {
+                self.retireBufferLocked(buf);
+            }
             return;
         }
     }
@@ -958,6 +1135,9 @@ fn onFrameDone(data: ?*anyopaque, callback: ?*c.wl_callback, time: u32) callconv
 
     pthread_mutex_lock(&self.mutex);
     if (self.frame_callback == cb) self.frame_callback = null;
+    self.frame_callbacks_seen = true;
+    self.frame_wait_supported = true;
+    self.suspended = false;
     pthread_mutex_unlock(&self.mutex);
 
     c.wl_callback_destroy(cb);

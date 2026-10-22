@@ -19,7 +19,12 @@ Implemented:
   * `queueBuffer` exports them through `android_wlegl`;
   * `wl_buffer.release` returns them to a small buffer pool;
   * `dequeueBuffer` blocks when the pool is empty;
-  * `wl_surface.frame` callbacks pace presentation to the compositor's vsync.
+  * `wl_surface.frame` callbacks pace presentation to the compositor's vsync;
+  * only buffers registered by the current native swapchain are dequeued, so
+    resumed/hidden windows do not fall into an out-of-date swapchain loop;
+  * when the compositor stops answering frame callbacks (a backgrounded TAWC
+    activity), `dequeueBuffer` parks until the next callback instead of
+    spinning.
 * Surface capability patching and swapchain-extent handling.
 * A provider override for compositors/embedders
   (`vkwlSetWaylandWindowProvider` or an exported
@@ -29,13 +34,13 @@ Not implemented yet:
 
 * An EGL/GLES shim (step 4).
 * Device-dispatch wrapping for every swapchain call.  `vkCreateSwapchainKHR`
-  and `vkDestroySwapchainKHR` are intercepted when the app resolves them
-  through this shim, but the native `vkCreateDevice` path may bypass them.  The
-  surface extent still flows through `vkGetPhysicalDeviceSurfaceCapabilitiesKHR`
-  and `ANativeWindow.perform(SET_BUFFERS_DIMENSIONS)`.
+  and `vkDestroySwapchainKHR` are intercepted through both
+  `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`; other device entry points
+  are passed through to the native driver.
 * Unconditional vsync.  If the compositor does not answer a frame callback
-  within 200 ms, the shim disables the wait for that window and falls back to
-  buffer-release/pool backpressure.
+  within 200 ms after having answered one before, the shim suspends
+  presentation until a callback arrives again, and falls back to
+  buffer-release/pool backpressure otherwise.
 
 ## How it works
 
@@ -88,6 +93,10 @@ It is not a wrapper around a Java/Surface object.
 * The private queue is dispatched until the frame callback arrives, so
   `queueBuffer` returns at most once per compositor vsync.  This is what
   replaces Android's normal buffer-queue throttling.
+* If a frame callback times out after callbacks have previously arrived, the
+  window is treated as suspended.  `dequeueBuffer` parks until the compositor
+  sends another callback, which TAWC does when the activity becomes visible
+  again.
 * `wl_buffer.release` puts the buffer back into the pool.
 * `dequeueBuffer` blocks on the private Wayland event queue until a release or
   another event arrives.
@@ -95,11 +104,22 @@ It is not a wrapper around a Java/Surface object.
   callbacks) use a private `wl_event_queue` and proxy wrappers, so the app's
   default queue and its existing `wl_surface` listeners are untouched.
 
-The surface extent is reported as the standard "undefined"
-(`currentExtent = 0xFFFFFFFF`) so Wayland clients can choose their own size.
-The native driver then calls `ANativeWindow.perform(SET_BUFFERS_DIMENSIONS)`
-with that size before the first buffer is dequeued.  Set `VKWL_WIDTH` and/or
-`VKWL_HEIGHT` to pin an extent instead.
+Android's WSI swapchain only accepts buffers that it dequeued while the
+swapchain was being created.  The shim wraps `vkCreateSwapchainKHR`, records
+the buffers dequeued during the native call, and marks only those as
+registered.  A normal acquire never returns an unregistered pool buffer;
+returning one makes `vkAcquireNextImageKHR` report
+`VK_ERROR_OUT_OF_DATE_KHR` (and cancel the buffer), which can recreate the
+swapchain every frame after a window is resumed.  Surplus buffers from an old
+swapchain stay alive until the compositor releases them, then are retired.
+
+The surface extent tracks the client's Wayland window size, clamped into the
+native driver's valid range.  The native driver still calls
+`ANativeWindow.perform(SET_BUFFERS_DIMENSIONS)` before the first buffer is
+dequeued.  Set `VKWL_WIDTH` and/or `VKWL_HEIGHT` to pin an extent instead.
+Reporting a defined extent also avoids one vkcube failure mode: after a
+suboptimal present it compares `currentExtent` with its swapchain size, and the
+undefined sentinel differs from every real size.
 
 The driver calls the variadic `ANativeWindow.perform` slot through a
 fixed-argument ABI on Adreno, so `src/native_window_shim.c` provides a matching
@@ -232,9 +252,11 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
 * Presentation uses `wl_surface.frame` callbacks.  A compositor that never
   answers one makes the shim fall back to release-based pacing after a 200 ms
   timeout; such a client is not vsync-limited.
-* The swapchain hooks are not guaranteed to run for every app, because the
-  native loader may resolve device commands directly from the native device.
-  The capability and `perform` paths are the reliable ones.
+* The swapchain hooks are installed through this shim's
+  `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`.  A loader that bypasses
+  both and resolves native device commands directly will not notify the shim
+  about swapchain creation, so buffer registration and extent rewriting will
+  not apply.  The capability and `perform` paths do not depend on that.
 * The fixed `perform` ABI is required by the Adreno driver.  A different vendor
   driver may use the normal variadic calling convention and need a different
   thunk.

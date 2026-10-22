@@ -73,10 +73,12 @@ const undefined_extent: vk.VkExtent2D = .{
     .height = std.math.maxInt(u32),
 };
 
-/// `VKWL_WIDTH`/`VKWL_HEIGHT` pin the surface to a fixed size.  Without them,
-/// report the standard "undefined" currentExtent so Wayland clients can choose
-/// their own size; the Android driver forwards that size to
-/// ANativeWindow.perform(SET_BUFFERS_DIMENSIONS) before first use.
+/// `VKWL_WIDTH`/`VKWL_HEIGHT` pin the surface to a fixed size.  Otherwise the
+/// current extent tracks the Wayland window.  Reporting a defined extent is
+/// important for clients such as vkcube: after a suboptimal present they
+/// compare currentExtent with their swapchain size and recreate the swapchain
+/// when it differs.  The undefined sentinel is always different and makes that
+/// check loop forever.
 fn envExtent() ?vk.VkExtent2D {
     if (native.envZ("VKWL_WIDTH") == null and native.envZ("VKWL_HEIGHT") == null) return null;
     const width = @max(1, @min(envU32("VKWL_WIDTH", 1280), 16384));
@@ -89,8 +91,14 @@ fn defaultWindowExtent() vk.VkExtent2D {
 }
 
 fn realDeviceProc(device: vk.VkDevice, name: [*:0]const u8) vk.PFN_vkVoidFunction {
-    const gdpa = global(vk.PFN_vkGetDeviceProcAddr, "vkGetDeviceProcAddr") orelse return null;
+    const gdpa = native.getGdpa() orelse
+        global(vk.PFN_vkGetDeviceProcAddr, "vkGetDeviceProcAddr") orelse return null;
     return gdpa(device, name);
+}
+
+fn deviceProc(comptime T: type, device: vk.VkDevice, name: [*:0]const u8) ?T {
+    const pfn = realDeviceProc(device, name) orelse return null;
+    return @ptrCast(pfn);
 }
 
 fn destroyNativeSurface(
@@ -125,6 +133,10 @@ pub fn getInstanceProcAddr(instance: vk.VkInstance, pName: [*:0]const u8) callco
     }
 
     if (std.mem.eql(u8, name, "vkGetInstanceProcAddr")) return @ptrCast(&getInstanceProcAddr);
+    if (std.mem.eql(u8, name, "vkGetDeviceProcAddr")) {
+        if (gipa(instance, pName)) |pfn| native.setGdpa(@ptrCast(pfn));
+        return @ptrCast(&getDeviceProcAddr);
+    }
     if (std.mem.eql(u8, name, "vkCreateWaylandSurfaceKHR")) return @ptrCast(&createWaylandSurfaceKHR);
     if (std.mem.eql(u8, name, "vkDestroySurfaceKHR")) return @ptrCast(&destroySurfaceKHR);
     if (std.mem.eql(u8, name, "vkGetPhysicalDeviceWaylandPresentationSupportKHR")) return @ptrCast(&getPhysicalDeviceWaylandPresentationSupportKHR);
@@ -422,11 +434,11 @@ pub fn getPhysicalDeviceSurfaceCapabilitiesKHR(
     const window = windowForSurface(surface);
     if (window == null) return res;
 
-    // The Android WSI reports the window's initial 1x1 size.  A Wayland client
-    // already knows what size it wants, so give it the standard sentinel unless
-    // the user explicitly pinned an extent.  The native driver calls
-    // ANativeWindow.perform(SET_BUFFERS_DIMENSIONS) with the chosen swapchain
-    // size; the initial window extent is just a fallback.
+    // The Android WSI reports the window's initial 1x1 size.  Use the pinned
+    // extent when requested, otherwise track the Wayland window size.  The
+    // native driver still calls ANativeWindow.perform(SET_BUFFERS_DIMENSIONS)
+    // with the swapchain size; a client that wants a different size must
+    // resize its Wayland surface so the window follows it.
     if (envExtent()) |extent| {
         if (caps.currentExtent.width != extent.width or caps.currentExtent.height != extent.height) {
             caps.currentExtent = extent;
@@ -436,12 +448,20 @@ pub fn getPhysicalDeviceSurfaceCapabilitiesKHR(
             native.log("pinned surface extent: {d}x{d}", .{ extent.width, extent.height });
         }
     } else {
-        caps.currentExtent = undefined_extent;
         if (window.?.width <= 1 or window.?.height <= 1) {
             const fallback = defaultWindowExtent();
             window.?.resize(@intCast(fallback.width), @intCast(fallback.height));
         }
-        native.log("using client-selected surface extent", .{});
+        const extent: vk.VkExtent2D = .{
+            .width = @intCast(window.?.width),
+            .height = @intCast(window.?.height),
+        };
+        caps.currentExtent = extent;
+        if (caps.minImageExtent.width > extent.width) caps.minImageExtent.width = extent.width;
+        if (caps.minImageExtent.height > extent.height) caps.minImageExtent.height = extent.height;
+        if (caps.maxImageExtent.width < extent.width) caps.maxImageExtent.width = extent.width;
+        if (caps.maxImageExtent.height < extent.height) caps.maxImageExtent.height = extent.height;
+        native.log("surface extent: {d}x{d}", .{ extent.width, extent.height });
     }
     return res;
 }
@@ -452,11 +472,13 @@ pub fn createSwapchainKHR(
     pAllocator: ?*const anyopaque,
     pSwapchain: ?*vk.VkSwapchainKHR,
 ) callconv(.c) vk.VkResult {
-    const create = global(vk.PFN_vkCreateSwapchainKHR, "vkCreateSwapchainKHR") orelse
+    const create: vk.PFN_vkCreateSwapchainKHR = deviceProc(vk.PFN_vkCreateSwapchainKHR, device, "vkCreateSwapchainKHR") orelse
+        global(vk.PFN_vkCreateSwapchainKHR, "vkCreateSwapchainKHR") orelse
         return .error_extension_not_present;
     const ci = pCreateInfo orelse return .error_initialization_failed;
 
     var rewritten = ci.*;
+    var tracked_window: ?*ww.WaylandNativeWindow = null;
     if (windowForSurface(rewritten.surface)) |window| {
         if (rewritten.imageExtent.width <= 1 or
             rewritten.imageExtent.height <= 1 or
@@ -466,6 +488,8 @@ pub fn createSwapchainKHR(
             rewritten.imageExtent = defaultWindowExtent();
         }
         window.resize(@intCast(rewritten.imageExtent.width), @intCast(rewritten.imageExtent.height));
+        window.beginSwapchainCreate();
+        tracked_window = window;
         native.log("creating swapchain: {d}x{d} fmt=0x{x} present={d}", .{
             rewritten.imageExtent.width,
             rewritten.imageExtent.height,
@@ -473,7 +497,9 @@ pub fn createSwapchainKHR(
             rewritten.presentMode,
         });
     }
-    return create(device, &rewritten, pAllocator, pSwapchain);
+    const res = create(device, &rewritten, pAllocator, pSwapchain);
+    if (tracked_window) |window| window.finishSwapchainCreate(res == .success);
+    return res;
 }
 
 pub fn destroySwapchainKHR(
@@ -481,7 +507,8 @@ pub fn destroySwapchainKHR(
     swapchain: vk.VkSwapchainKHR,
     pAllocator: ?*const anyopaque,
 ) callconv(.c) void {
-    const destroy = global(vk.PFN_vkDestroySwapchainKHR, "vkDestroySwapchainKHR") orelse return;
+    const destroy: vk.PFN_vkDestroySwapchainKHR = deviceProc(vk.PFN_vkDestroySwapchainKHR, device, "vkDestroySwapchainKHR") orelse
+        global(vk.PFN_vkDestroySwapchainKHR, "vkDestroySwapchainKHR") orelse return;
     destroy(device, swapchain, pAllocator);
 }
 

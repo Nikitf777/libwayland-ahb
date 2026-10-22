@@ -18,6 +18,7 @@ else
 var mutex: std.atomic.Mutex = .unlocked;
 var handle: ?*anyopaque = null;
 var gipa: ?vk.PFN_vkGetInstanceProcAddr = null;
+var gdpa: ?vk.PFN_vkGetDeviceProcAddr = null;
 
 fn lock() void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -61,6 +62,22 @@ pub fn getGipa() ?vk.PFN_vkGetInstanceProcAddr {
     defer unlock();
     initLocked();
     return gipa;
+}
+
+/// The real `vkGetDeviceProcAddr`, captured from an instance.  The platform
+/// loader does not necessarily expose a usable device-proc lookup through
+/// `vkGetInstanceProcAddr(NULL, ...)`, but it does once an instance exists.
+pub fn setGdpa(pfn: vk.PFN_vkGetDeviceProcAddr) void {
+    lock();
+    defer unlock();
+    gdpa = pfn;
+}
+
+pub fn getGdpa() ?vk.PFN_vkGetDeviceProcAddr {
+    lock();
+    defer unlock();
+    initLocked();
+    return gdpa;
 }
 
 /// Look up a symbol exported by the real loader (used for functions whose
