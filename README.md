@@ -169,34 +169,28 @@ The vendored `android_wlegl` client files can be regenerated with:
 
 ## Run
 
-### Vulkan information
+`scripts/vkwl-run` is a generic environment wrapper.  It puts
+`runtime/libvulkan.so` (a symlink to `zig-out/lib/libvkwl.so`) first in
+`LD_LIBRARY_PATH`, then `exec`s the command.  It has no compositor-specific
+logic.
 
 ```sh
-./scripts/vulkaninfo-wrapper.sh --summary
+./scripts/vkwl-run vulkaninfo --summary
+./scripts/vkwl-run vkcube --c 10
 ```
 
-The wrapper puts `runtime/libvulkan.so` (a symlink to `zig-out/lib/libvkwl.so`)
-first in `LD_LIBRARY_PATH`, so `vulkaninfo` loads the shim.  It should list
-`VK_KHR_wayland_surface : extension revision 6` alongside
-`VK_KHR_android_surface`, with the native Adreno driver.
+It can wrap either the final client or a compositor's launcher.  If the
+launcher preserves its environment across the socket hand-off, both orders
+work:
+
+```sh
+./scripts/vkwl-run <launcher> vkcube
+<launcher> ./scripts/vkwl-run vkcube
+```
 
 Without a Wayland display, `vulkaninfo` still prints
 `'DISPLAY' environment variable not set... skipping surface info`.  That is
 normal; the extension list is the important part.
-
-### A client under TAWC
-
-```sh
-./scripts/tawc-run.sh vkcube --c 10
-```
-
-The script uses
-`/data/data/com.termux/files/home/projects/rust/tawc/termux-wayland/wayland-run`
-by default.  Override it with `TAWC_WAYLAND_RUN=/path/to/wayland-run`.
-
-TAWC's launcher deliberately clears `LD_LIBRARY_PATH` before handing the
-Wayland socket to the client.  `tawc-run.sh` therefore starts the client
-through a POSIX shell and restores the shim path after that hand-off.
 
 ### Environment variables
 
@@ -206,14 +200,12 @@ through a POSIX shell and restores the shim path after that hand-off.
 | `VKWL_NATIVE_LOADER=/path/to/libvulkan.so` | Use a different native loader. |
 | `VKWL_WIDTH=<pixels>` | Pin the surface width. |
 | `VKWL_HEIGHT=<pixels>` | Pin the surface height. |
-| `TAWC_WAYLAND_RUN=/path` | Override the TAWC `wayland-run` path. |
-| `TAWC_SHELL=/path/sh` | Override the shell used by `tawc-run.sh`. |
 
 For example, to pin a 640x480 surface and log buffer setup:
 
 ```sh
 VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
-  ./scripts/tawc-run.sh vkcube --c 10
+  ./scripts/vkwl-run vkcube --c 10
 ```
 
 ## Layout
@@ -235,8 +227,7 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
 | `src/vulkan_forwarders.c` | Generated constructor that resolves forwarder slots |
 | `src/protocol/` | Generated `android_wlegl` client protocol |
 | `protocols/android_wlegl.xml` | Source protocol definition |
-| `scripts/tawc-run.sh` | Run a client under TAWC with the shim |
-| `scripts/vulkaninfo-wrapper.sh` | Run `vulkaninfo` with the shim |
+| `scripts/vkwl-run` | Run an executable with the shim in `LD_LIBRARY_PATH` |
 | `scripts/generate-protocols.sh` | Regenerate the vendored protocol files |
 | `scripts/generate-vulkan-forwarders.py` | Regenerate direct-call forwarders |
 
