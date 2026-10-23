@@ -145,7 +145,8 @@ Requirements:
   AHB handles (TAWC does).
 
 ```sh
-cd /data/data/com.termux/files/home/projects/zig/libwayland-ahb
+git clone https://github.com/Nikitf777/libwayland-ahb.git
+cd libwayland-ahb
 zig build -Doptimize=ReleaseSmall
 ```
 
