@@ -78,6 +78,60 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(lib);
+
+    // Native-bionic Wayland EGL shim.  It forward-exports the platform EGL
+    // entry points and intercepts the Wayland platform/window calls, using
+    // the same client-side ANativeWindow/AHB/android_wlegl bridge as the
+    // Vulkan shim.
+    const egl = b.addLibrary(.{
+        .name = "eglahb",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/egl.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    egl.setLibCFile(b.addWriteFiles().add("libc-android-egl.txt", b.fmt(
+        \\include_dir={s}/include
+        \\sys_include_dir={s}/include
+        \\crt_dir={s}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ prefix, prefix, kit_dir })));
+
+    egl.root_module.link_libc = true;
+    egl.root_module.linkSystemLibrary("dl", .{});
+    egl.root_module.addLibraryPath(.{ .cwd_relative = kit_dir });
+    egl.root_module.addIncludePath(b.path("src"));
+    egl.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+    egl.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include", triple }) });
+    egl.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+    egl.root_module.linkSystemLibrary("wayland-client", .{});
+    egl.root_module.linkSystemLibrary("wayland-egl", .{});
+    egl.root_module.addCSourceFile(.{
+        .file = b.path("src/native_window_shim.c"),
+        .flags = &.{},
+    });
+    egl.root_module.addCSourceFile(.{
+        .file = b.path("src/protocol/android_wlegl_client.c"),
+        .flags = &.{},
+    });
+    // Directly-linked EGL clients need every platform EGL symbol at load
+    // time, even the entry points we do not intercept.
+    egl.root_module.addCSourceFile(.{
+        .file = b.path("src/egl_forwarders.S"),
+        .flags = &.{},
+    });
+    egl.root_module.addCSourceFile(.{
+        .file = b.path("src/egl_forwarders.c"),
+        .flags = &.{},
+    });
+
+    b.installArtifact(egl);
 }
 
 fn androidTriple(arch: std.Target.Cpu.Arch) []const u8 {

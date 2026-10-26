@@ -1,0 +1,66 @@
+#!/bin/sh
+# Run an executable with the AHB/vendor-driver shims first in LD_LIBRARY_PATH.
+#
+# The shim directory provides:
+#   libvulkan.so[.1]  -> libvkwl.so      (Vulkan WSI)
+#   libEGL.so[.1]     -> libeglahb.so    (Wayland EGL platform)
+#   libGLESv2.so[.2]  -> system vendor GLES
+#
+# Example:
+#   scripts/wlahb-run vulkaninfo --summary
+#   scripts/wlahb-run weston --backend=wayland
+#   VKWL_LOG=1 scripts/wlahb-run vkcube --c 10
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+runtime="$root/runtime"
+vk="$root/zig-out/lib/libvkwl.so"
+egl="$root/zig-out/lib/libeglahb.so"
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: $0 <command> [args...]" >&2
+    exit 2
+fi
+
+mkdir -p "$runtime"
+
+if [ -f "$vk" ]; then
+    ln -sf "$vk" "$runtime/libvulkan.so"
+    ln -sf "$vk" "$runtime/libvulkan.so.1"
+else
+    rm -f "$runtime/libvulkan.so" "$runtime/libvulkan.so.1"
+fi
+if [ -f "$egl" ]; then
+    ln -sf "$egl" "$runtime/libEGL.so"
+    ln -sf "$egl" "$runtime/libEGL.so.1"
+else
+    rm -f "$runtime/libEGL.so" "$runtime/libEGL.so.1"
+    rm -f "$runtime/libGLESv2.so" "$runtime/libGLESv2.so.2"
+    rm -f "$runtime/libGLESv1_CM.so" "$runtime/libGLESv1_CM.so.1"
+fi
+
+# The vendor GLES libraries are directly usable from bionic.  Their DT_NEEDED
+# libEGL.so resolves to the shim above, so contexts and surfaces stay vendor
+# handles while creation goes through our Wayland bridge.
+if [ -f "$egl" ]; then
+    syslib=/system/lib64
+    [ -d "$syslib" ] || syslib=/system/lib
+    for name in libGLESv2.so libGLESv1_CM.so; do
+        [ -f "$syslib/$name" ] || continue
+        ln -sf "$syslib/$name" "$runtime/$name"
+        case "$name" in
+            libGLESv2.so) ln -sf "$syslib/$name" "$runtime/libGLESv2.so.2" ;;
+            libGLESv1_CM.so) ln -sf "$syslib/$name" "$runtime/libGLESv1_CM.so.1" ;;
+        esac
+    done
+fi
+
+if [ ! -f "$runtime/libEGL.so" ] && [ ! -f "$runtime/libvulkan.so" ]; then
+    echo "missing shim libraries; run 'zig build' first" >&2
+    exit 1
+fi
+
+LD_LIBRARY_PATH="$runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+
+exec "$@"

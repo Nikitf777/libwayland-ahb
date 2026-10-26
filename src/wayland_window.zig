@@ -48,6 +48,20 @@ const max_buffers = 8;
 const default_target_buffers = 3;
 const frame_wait_timeout_ms: c_int = 200;
 
+/// Application-owned `wl_egl_window` -> our client-side ANativeWindow.  The
+/// map holds the only reference to the window; the application's
+/// `wl_egl_window_destroy` callback removes it again.
+var egl_window_map: std.AutoHashMapUnmanaged(usize, *WaylandNativeWindow) = .empty;
+var egl_window_map_mutex: std.atomic.Mutex = .unlocked;
+
+fn eglMapLock() void {
+    while (!egl_window_map_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn eglMapUnlock() void {
+    egl_window_map_mutex.unlock();
+}
+
 const BufferState = enum {
     free,
     dequeued,
@@ -92,6 +106,9 @@ pub const WaylandNativeWindow = struct {
     wlegl: ?*c.android_wlegl = null,
 
     egl_window: ?*c.wl_egl_window = null,
+    /// True when we created `egl_window` ourselves (Vulkan path).  The EGL
+    /// path adopts the application's window and must not destroy it.
+    owns_egl_window: bool = true,
 
     mutex: std.c.pthread_mutex_t = .{},
     dispatch_mutex: std.c.pthread_mutex_t = .{},
@@ -138,11 +155,38 @@ pub const WaylandNativeWindow = struct {
     destroying: bool = false,
 
     pub fn create(display: *c.wl_display, surface: *c.wl_surface) !*WaylandNativeWindow {
+        return createInternal(display, surface, null);
+    }
+
+    /// Wrap an application-owned `wl_egl_window` for the EGL path.
+    ///
+    /// The application owns the window and destroys it with
+    /// `wl_egl_window_destroy`; we only install the resize/destroy callbacks
+    /// and must not destroy it ourselves.
+    // `egl.zig` has its own C import namespace, so opaque Wayland pointers
+    // cross this boundary as anyopaque and are cast to our types here.
+    pub fn createForEglWindow(
+        display_ptr: *anyopaque,
+        egl_window_ptr: *anyopaque,
+    ) !*WaylandNativeWindow {
+        const display: *c.wl_display = @ptrCast(display_ptr);
+        const egl_window: *c.wl_egl_window = @ptrCast(@alignCast(egl_window_ptr));
+        if (egl_window.surface == null) return error.NoSurface;
+        const surface: *c.wl_surface = @ptrCast(egl_window.surface);
+        return createInternal(display, surface, egl_window);
+    }
+
+    fn createInternal(
+        display: *c.wl_display,
+        surface: *c.wl_surface,
+        existing_egl_window: ?*c.wl_egl_window,
+    ) !*WaylandNativeWindow {
         const self = try allocator.create(WaylandNativeWindow);
         self.* = .{
             .base = undefined,
             .display = display,
             .surface = surface,
+            .owns_egl_window = existing_egl_window == null,
         };
         errdefer self.destroyInternal();
 
@@ -176,13 +220,22 @@ pub const WaylandNativeWindow = struct {
             return error.NoAndroidWlegl;
         }
 
-        const ew_raw = c.wl_egl_window_create(surface, self.width, self.height);
-        if (ew_raw == null) return error.NoEglWindow;
-        const ew: *c.wl_egl_window = @ptrCast(ew_raw);
-        self.egl_window = ew;
-        ew.driver_private = self;
-        ew.resize_callback = &eglResizeCallback;
-        ew.destroy_window_callback = &eglDestroyCallback;
+        if (existing_egl_window) |ew| {
+            self.width = @max(1, ew.width);
+            self.height = @max(1, ew.height);
+            self.egl_window = ew;
+            ew.driver_private = self;
+            ew.resize_callback = &eglResizeCallback;
+            ew.destroy_window_callback = &eglDestroyCallback;
+        } else {
+            const ew_raw = c.wl_egl_window_create(surface, self.width, self.height);
+            if (ew_raw == null) return error.NoEglWindow;
+            const ew: *c.wl_egl_window = @ptrCast(ew_raw);
+            self.egl_window = ew;
+            ew.driver_private = self;
+            ew.resize_callback = &eglResizeCallback;
+            ew.destroy_window_callback = &eglDestroyCallback;
+        }
 
         native.log("client Wayland window created: {d}x{d} fmt=0x{x} usage=0x{x}", .{
             self.width,
@@ -191,6 +244,45 @@ pub const WaylandNativeWindow = struct {
             self.usage,
         });
         return self;
+    }
+
+    /// Return the client-side window for an application-owned
+    /// `wl_egl_window`, creating it on first use.  The returned pointer is
+    /// owned by the map and stays valid until the application destroys the
+    /// `wl_egl_window`.
+    pub fn acquireEglWindow(
+        display_ptr: *anyopaque,
+        egl_window_ptr: *anyopaque,
+    ) ?*WaylandNativeWindow {
+        const key = @intFromPtr(egl_window_ptr);
+
+        eglMapLock();
+        if (egl_window_map.get(key)) |window| {
+            eglMapUnlock();
+            return window;
+        }
+        eglMapUnlock();
+
+        const window = createForEglWindow(display_ptr, egl_window_ptr) catch |err| {
+            native.log("EGL Wayland window creation failed: {s}", .{@errorName(err)});
+            return null;
+        };
+
+        eglMapLock();
+        const entry = egl_window_map.getOrPut(allocator, key) catch {
+            eglMapUnlock();
+            window.release();
+            return null;
+        };
+        if (entry.found_existing) {
+            const existing = entry.value_ptr.*;
+            eglMapUnlock();
+            window.release();
+            return existing;
+        }
+        entry.value_ptr.* = window;
+        eglMapUnlock();
+        return window;
     }
 
     pub fn release(self: *WaylandNativeWindow) void {
@@ -694,7 +786,7 @@ pub const WaylandNativeWindow = struct {
             ew.driver_private = null;
             ew.resize_callback = null;
             ew.destroy_window_callback = null;
-            c.wl_egl_window_destroy(@ptrCast(ew));
+            if (self.owns_egl_window) c.wl_egl_window_destroy(@ptrCast(ew));
         }
 
         if (self.wlegl) |wlegl| {
@@ -1153,9 +1245,20 @@ fn eglResizeCallback(egl_window: [*c]c.wl_egl_window, data: ?*anyopaque) callcon
 
 fn eglDestroyCallback(data: ?*anyopaque) callconv(.c) void {
     const self: *WaylandNativeWindow = @ptrCast(@alignCast(data orelse return));
+
+    var key: ?usize = null;
     pthread_mutex_lock(&self.mutex);
+    if (self.egl_window) |ew| key = @intFromPtr(ew);
     self.egl_window = null;
     pthread_mutex_unlock(&self.mutex);
+
+    if (key) |k| {
+        eglMapLock();
+        if (egl_window_map.get(k) == self) _ = egl_window_map.remove(k);
+        eglMapUnlock();
+    }
+
+    self.release();
 }
 
 fn createWleglBuffer(self: *WaylandNativeWindow, buf: *Buffer) ?*c.wl_buffer {

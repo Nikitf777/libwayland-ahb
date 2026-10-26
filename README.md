@@ -1,11 +1,14 @@
 # libwayland-ahb
 
-A Vulkan loader shim that makes Android's native Vulkan driver expose
-`VK_KHR_wayland_surface`, with a client-side `ANativeWindow` backed by
+Native-bionic Wayland WSI shims that make Android's vendor graphics drivers
+usable by ordinary Termux clients.  The Vulkan shim exposes
+`VK_KHR_wayland_surface`; the EGL shim exposes `EGL_PLATFORM_WAYLAND_KHR`.
+Both present through a client-side `ANativeWindow` backed by
 `AHardwareBuffer` and the compositor's `android_wlegl` protocol.
 
-This lets an ordinary Termux Wayland client render with the vendor GPU driver
-(for example `vkcube` under TAWC) instead of falling back to Mesa or software.
+This lets a Termux Wayland client render with the vendor GPU driver (for
+example `vkcube` or Weston under TAWC) instead of falling back to Mesa's
+software path or Pixman.
 
 ## Status
 
@@ -29,10 +32,30 @@ Implemented:
 * A provider override for compositors/embedders
   (`vkwlSetWaylandWindowProvider` or an exported
   `vkwl_wayland_to_android_window`).
+* An EGL shim (`libEGL.so`) that:
+  * loads `/system/lib64/libEGL.so` by absolute path, never Termux Mesa;
+  * advertises `EGL_EXT_platform_base`, `EGL_EXT_platform_wayland` and
+    `EGL_KHR_platform_wayland`;
+  * implements `eglGetDisplay`, `eglGetPlatformDisplay[EXT]`,
+    `eglCreateWindowSurface` and `eglCreatePlatformWindowSurface[EXT]` for
+    `wl_egl_window`;
+  * forwards every other platform EGL entry point as a generated direct-call
+    stub;
+  * adopts the application's `wl_egl_window` and uses the same
+    AHB/`android_wlegl`/frame-callback pool as the Vulkan path.
+
+The runner also puts the platform `libGLESv2.so`/`libGLESv1_CM.so` ahead of
+Termux Mesa.  The platform GLES loader's internal libEGL dependency resolves
+to the EGL shim, which forwards the one Android-internal symbol it needs
+(`_ZN7android18egl_get_connectionEv`).
 
 Not implemented yet:
 
-* An EGL/GLES shim (step 4).
+* wlroots' nested backend still creates its GLES renderer through
+  `EGL_KHR_platform_gbm`/`EGL_EXT_platform_device`, not
+  `EGL_PLATFORM_WAYLAND_KHR`.  This shim does not provide GBM, so labwc/sway
+  still fall back to Pixman; Weston and clients that use the Wayland EGL
+  platform do not.
 * Device-dispatch wrapping for every swapchain call.  `vkCreateSwapchainKHR`
   and `vkDestroySwapchainKHR` are intercepted through both
   `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`; other device entry points
@@ -78,6 +101,42 @@ they preserve every argument register and do not need a prototype per command.
 `src/vulkan_forwarders.S` and `src/vulkan_forwarders.c` are generated from the
 native loader's dynamic symbol table; regenerate them with
 `scripts/generate-vulkan-forwarders.py` when the loader changes.
+
+### EGL
+
+The EGL shim has the same shape, but it replaces `libEGL.so` instead of
+`libvulkan.so`:
+
+```text
+Wayland client (Weston, GTK, ...)
+  |  eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_KHR, wl_display)
+  |  eglCreateWindowSurface(..., wl_egl_window)
+  v
+libeglahb.so
+  |  loads /system/lib64/libEGL.so and the vendor EGL driver
+  |  creates/reuses WaylandNativeWindow for the wl_surface
+  |  vendor eglSwapBuffers -> ANativeWindow.queueBuffer
+  |  AHB + android_wlegl
+  v
+TAWC / Wayland compositor
+```
+
+`eglGetPlatformDisplay[EXT]` returns the vendor Android display and remembers
+that it is being used as a Wayland display.  `eglCreateWindowSurface` and
+`eglCreatePlatformWindowSurface[EXT]` translate the application's
+`wl_egl_window` to its `wl_surface`, get the display with
+`wl_proxy_get_display`, and hand the shim's `ANativeWindow` to vendor EGL.  On
+swap the vendor driver calls the same `ANativeWindow.queueBuffer` described
+above, so there is no second buffer path.
+
+Every other platform EGL symbol is a generated direct-call stub.  EGL clients
+link those symbols at load time, so they cannot be left to
+`eglGetProcAddress` alone.  Regenerate them with
+`scripts/generate-egl-forwarders.py` when the platform EGL changes.
+
+The runner also places the platform GLES libraries ahead of Termux Mesa.  The
+platform GLES loader needs `_ZN7android18egl_get_connectionEv` from libEGL;
+the EGL shim exports that symbol as a forwarder to the real platform libEGL.
 
 ### Extension translation
 
@@ -152,8 +211,8 @@ zig build -Doptimize=ReleaseSmall
 
 `build.zig` creates `.zig-cache/libc-kit/<triple>/` by symlinking Android CRT
 objects and bionic linker stubs, then tells Zig to use that kit.  This produces
-a shared object with normal bionic `DT_NEEDED` entries and no dependency on the
-build device's `/system/lib64`.
+`zig-out/lib/libvkwl.so` and `zig-out/lib/libeglahb.so`, with normal bionic
+`DT_NEEDED` entries and no dependency on the build device's `/system/lib64`.
 
 Override the Termux prefix with:
 
@@ -169,23 +228,29 @@ The vendored `android_wlegl` client files can be regenerated with:
 
 ## Run
 
-`scripts/vkwl-run` is a generic environment wrapper.  It puts
-`runtime/libvulkan.so` (a symlink to `zig-out/lib/libvkwl.so`) first in
-`LD_LIBRARY_PATH`, then `exec`s the command.  It has no compositor-specific
-logic.
+`scripts/wlahb-run` is a generic environment wrapper.  It puts the shims in
+`runtime/` first in `LD_LIBRARY_PATH`, then `exec`s the command.  It has no
+compositor-specific logic.
 
 ```sh
-./scripts/vkwl-run vulkaninfo --summary
-./scripts/vkwl-run vkcube --c 10
+./scripts/wlahb-run vulkaninfo --summary
+./scripts/wlahb-run vkcube --c 10
+./scripts/wlahb-run weston --backend=wayland
 ```
+
+`runtime/` contains:
+
+* `libvulkan.so[.1]` -> `libvkwl.so`
+* `libEGL.so[.1]` -> `libeglahb.so`
+* `libGLESv2.so[.2]` and `libGLESv1_CM.so[.1]` -> the platform GLES libraries
 
 It can wrap either the final client or a compositor's launcher.  If the
 launcher preserves its environment across the socket hand-off, both orders
 work:
 
 ```sh
-./scripts/vkwl-run <wayland-launcher> vkcube
-<wayland-launcher> ./scripts/vkwl-run vkcube
+./scripts/wlahb-run <wayland-launcher> vkcube
+<wayland-launcher> ./scripts/wlahb-run vkcube
 ```
 
 Without a Wayland display, `vulkaninfo` still prints
@@ -197,7 +262,8 @@ normal; the extension list is the important part.
 | Variable | Meaning |
 | --- | --- |
 | `VKWL_LOG=1` | Print shim diagnostics to stderr. |
-| `VKWL_NATIVE_LOADER=/path/to/libvulkan.so` | Use a different native loader. |
+| `VKWL_NATIVE_LOADER=/path/to/libvulkan.so` | Use a different native Vulkan loader. |
+| `VKWL_NATIVE_EGL=/path/to/libEGL.so` | Use a different native EGL library. |
 | `VKWL_WIDTH=<pixels>` | Pin the surface width. |
 | `VKWL_HEIGHT=<pixels>` | Pin the surface height. |
 
@@ -205,7 +271,7 @@ For example, to pin a 640x480 surface and log buffer setup:
 
 ```sh
 VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
-  ./scripts/vkwl-run vkcube --c 10
+  ./scripts/wlahb-run vkcube --c 10
 ```
 
 ## Layout
@@ -225,11 +291,16 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
 | `src/vk.zig` | Minimal Vulkan ABI types |
 | `src/vulkan_forwarders.S` | Generated direct-call stubs for native entry points |
 | `src/vulkan_forwarders.c` | Generated constructor that resolves forwarder slots |
+| `src/egl.zig` | Wayland EGL platform translation and extension-string injection |
+| `src/egl_native.zig` | Platform libEGL discovery and typed entry points |
+| `src/egl_forwarders.S` | Generated direct-call stubs for platform libEGL |
+| `src/egl_forwarders.c` | Generated constructor that resolves EGL forwarder slots |
 | `src/protocol/` | Generated `android_wlegl` client protocol |
 | `protocols/android_wlegl.xml` | Source protocol definition |
-| `scripts/vkwl-run` | Run an executable with the shim in `LD_LIBRARY_PATH` |
+| `scripts/wlahb-run` | Run an executable with the shims in `LD_LIBRARY_PATH` |
 | `scripts/generate-protocols.sh` | Regenerate the vendored protocol files |
-| `scripts/generate-vulkan-forwarders.py` | Regenerate direct-call forwarders |
+| `scripts/generate-vulkan-forwarders.py` | Regenerate Vulkan direct-call forwarders |
+| `scripts/generate-egl-forwarders.py` | Regenerate EGL direct-call forwarders |
 
 ## ABI notes
 
@@ -248,11 +319,18 @@ VKWL_LOG=1 VKWL_WIDTH=640 VKWL_HEIGHT=480 \
 ## Current limitations
 
 * The compositor must implement `android_wlegl` and import client-allocated
-  AHB buffers.  A compositor without it (for example headless Weston) makes
-  window creation fail with `NoAndroidWlegl`; the shim does not fall back to
-  shared memory.
-* No EGL/GLES integration yet.  Only Vulkan clients that use
-  `VK_KHR_wayland_surface` are covered.
+  AHB buffers.  A compositor without it makes window creation fail with
+  `NoAndroidWlegl`; the shim does not fall back to shared memory.  This also
+  applies to a nested compositor's clients: they connect to the nested
+  compositor, not to TAWC, and stock Weston/wlroots do not advertise
+  `android_wlegl`.
+* The EGL shim covers clients that use `EGL_PLATFORM_WAYLAND_KHR`.  It does
+  not provide GBM or `EGL_PLATFORM_DEVICE_EXT`, so wlroots' nested Wayland
+  backend (labwc, sway) still cannot create its GLES renderer and falls back
+  to Pixman.  On the tested Adreno stack the vendor EGL also does not expose
+  `EGL_EXT_image_dma_buf_import`, so nested compositor clients cannot share
+  dmabufs through the standard protocol unless the nested compositor
+  implements `android_wlegl` itself.
 * Presentation uses `wl_surface.frame` callbacks.  A compositor that never
   answers one makes the shim fall back to release-based pacing after a 200 ms
   timeout; such a client is not vsync-limited.
